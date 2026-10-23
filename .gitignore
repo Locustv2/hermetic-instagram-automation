@@ -1,0 +1,15 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# OS & Python artifacts
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+venv/
