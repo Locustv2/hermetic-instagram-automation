@@ -4,7 +4,7 @@ Daily Instagram Publisher for the Principle of Correspondence Series.
 
 Selects the next unpublished quote post from posts.json, verifies the quote image,
 builds the Instagram caption (description + 5 hashtags), and publishes it via
-the Instagram Graph API.
+the Official Instagram Graph API.
 """
 
 import argparse
@@ -12,6 +12,7 @@ import datetime
 import json
 import os
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -19,6 +20,9 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 POSTS_FILE = BASE_DIR / "posts.json"
 ENV_FILE = BASE_DIR / ".env"
+DEFAULT_IMAGE_BASE_URL = (
+    "https://raw.githubusercontent.com/Locustv2/hermetic-instagram-automation/main"
+)
 
 
 def load_env(env_path: Path) -> None:
@@ -37,14 +41,59 @@ def format_caption(post: dict) -> str:
     return f'{post["description"]}\n\n{hashtags_str}'
 
 
+def api_get_json(url: str) -> dict:
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def resolve_ig_user_id(access_token: str) -> tuple[str, str]:
+    """
+    Auto-discover the Instagram Account ID and appropriate Graph API host
+    ('https://graph.instagram.com/v21.0' or 'https://graph.facebook.com/v21.0')
+    from the provided access token.
+    """
+    q = urllib.parse.urlencode({"access_token": access_token})
+
+    # 1. Try Instagram API with Instagram Login (tokens typically start with IG...)
+    try:
+        ig_me = api_get_json(
+            f"https://graph.instagram.com/v21.0/me?fields=id,user_id,username&{q}"
+        )
+        uid = ig_me.get("user_id") or ig_me.get("id")
+        if uid:
+            return str(uid), "https://graph.instagram.com/v21.0"
+    except Exception:
+        pass
+
+    # 2. Try Facebook Graph API connected pages -> instagram_business_account
+    try:
+        fb_accounts = api_get_json(
+            f"https://graph.facebook.com/v21.0/me/accounts?fields=id,name,instagram_business_account&{q}"
+        )
+        for page in fb_accounts.get("data", []):
+            ig_acct = page.get("instagram_business_account")
+            if ig_acct and ig_acct.get("id"):
+                return str(ig_acct["id"]), "https://graph.facebook.com/v21.0"
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Could not automatically discover IG_USER_ID from IG_ACCESS_TOKEN. "
+        "Please set IG_USER_ID explicitly in .env or verify token permissions "
+        "(instagram_basic / instagram_content_publish or instagram_business_content_publish)."
+    )
+
+
 def publish_to_instagram_graph_api(
     ig_user_id: str,
     access_token: str,
     image_url: str,
     caption: str,
+    api_host: str = "https://graph.facebook.com/v21.0",
 ) -> str:
     """Create a media container and publish it via the Instagram Graph API."""
-    base_api = f"https://graph.facebook.com/v21.0/{ig_user_id}"
+    base_api = f"{api_host.rstrip('/')}/{ig_user_id}"
 
     # Step 1: Create media container
     container_data = urllib.parse.urlencode(
@@ -110,44 +159,52 @@ def main() -> int:
         print(f"Error: Image file {image_file} does not exist.", file=sys.stderr)
         return 1
 
+    image_base_url = os.environ.get(
+        "IG_IMAGE_BASE_URL", DEFAULT_IMAGE_BASE_URL
+    ).strip() or DEFAULT_IMAGE_BASE_URL
+    image_url = next_post.get("image_url") or (
+        f"{image_base_url.rstrip('/')}/{next_post['image_path']}"
+    )
+
     caption = format_caption(next_post)
     print(f"=== Selected Post #{next_post['id']}: {next_post['concept']} ===")
     print(f"Quote on Image : {next_post['quote']}")
-    print(f"Image Path     : {image_file}")
+    print(f"Local Image    : {image_file}")
+    print(f"Public HTTPS   : {image_url}")
     print(f"Caption        :\n{caption}\n")
 
     if args.dry_run:
         print("Dry run complete. Post is ready for publishing.")
         return 0
 
-    ig_user_id = os.environ.get("IG_USER_ID", "").strip()
     access_token = os.environ.get("IG_ACCESS_TOKEN", "").strip()
-    image_base_url = os.environ.get(
-        "IG_IMAGE_BASE_URL",
-        "https://raw.githubusercontent.com/Locustv2/hermetic-instagram-automation/main",
-    ).strip()
-    image_url = next_post.get("image_url") or (
-        f"{image_base_url.rstrip('/')}/{next_post['image_path']}"
-        if image_base_url
-        else ""
-    )
+    ig_user_id = os.environ.get("IG_USER_ID", "").strip()
 
-    if not ig_user_id or not access_token or not image_url:
+    if not access_token:
         print(
-            "Instagram Graph API credentials are not yet configured in .env.\n"
-            "Required environment variables in /Users/locustv2/Documents/antigravity/elegant-bose/.env:\n"
-            "  IG_USER_ID=<your-instagram-business-account-id>\n"
+            "Instagram Graph API token is not set yet.\n"
+            "Paste your token into /Users/locustv2/Documents/antigravity/elegant-bose/.env:\n"
             "  IG_ACCESS_TOKEN=<your-instagram-graph-api-access-token>\n"
-            "  IG_IMAGE_BASE_URL=<public-https-base-url-hosting-the-images-folder>",
+            "  IG_USER_ID=<optional: auto-discovered if left blank>",
             file=sys.stderr,
         )
         return 2
+
+    api_host = (
+        "https://graph.instagram.com/v21.0"
+        if access_token.startswith("IG")
+        else "https://graph.facebook.com/v21.0"
+    )
+    if not ig_user_id:
+        ig_user_id, api_host = resolve_ig_user_id(access_token)
+        print(f"Auto-discovered IG_USER_ID: {ig_user_id} ({api_host})")
 
     media_id = publish_to_instagram_graph_api(
         ig_user_id=ig_user_id,
         access_token=access_token,
         image_url=image_url,
         caption=caption,
+        api_host=api_host,
     )
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
     next_post["published"] = True
